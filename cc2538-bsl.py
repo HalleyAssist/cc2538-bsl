@@ -214,21 +214,6 @@ class CommandInterface(object):
         # DTR: connected to the bootloader pin
         # RTS: connected to !RESET
         # If inverted is True, pin connections are the other way round
-        if inverted:
-            set_bootloader_pin = self.sp.setRTS
-            set_reset_pin = self.sp.setDTR
-        else:
-            set_bootloader_pin = self.sp.setDTR
-            set_reset_pin = self.sp.setRTS
-
-        set_bootloader_pin(1 if not dtr_active_high else 0)
-        set_reset_pin(0)
-        set_reset_pin(1)
-        set_reset_pin(0)
-        time.sleep(0.002)  # Make sure the pin is still asserted when the chip
-                           # comes out of reset. This fixes an issue where there
-                           # wasn't enough delay here on Mac.
-        set_bootloader_pin(0 if not dtr_active_high else 1)
 
         # Some boards have a co-processor that detects this sequence here and
         # then drives the main chip's BSL enable and !RESET pins. Depending on
@@ -1092,6 +1077,8 @@ if __name__ == "__main__":
 
         if conf['write']:
             # TODO: check if boot loader back-door is open, need to read flash size first to get address
+            if not conf['erase']:
+                device.command_interface.cmdEraseMemory(device.flash_start_addr, len(firmware.bytes))
             if cmd.writeMemory(conf['address'], firmware.bytes):
                 mdebug(5, "    Write done                                ")
             else:
