@@ -177,7 +177,7 @@ class FirmwareFile(object):
         with open(path, 'rb') as f:
             self.bytes = bytearray(f.read())
 
-    def crc32(self):
+    def crc32(self, n_bytes=0):
         """
         Return the crc32 checksum of the firmware image
 
@@ -186,7 +186,9 @@ class FirmwareFile(object):
             returned by the ROM bootloader's COMMAND_CRC32
         """
         if self._crc32 is None:
-            self._crc32 = binascii.crc32(bytearray(self.bytes)) & 0xffffffff
+            if n_bytes <= 0:
+                n_bytes = len(self.bytes)
+            self._crc32 = binascii.crc32(bytearray(self.bytes)[:n_bytes]) & 0xffffffff
 
         return self._crc32
 
@@ -667,6 +669,8 @@ class CC2538(Chip):
     def __init__(self, command_interface):
         super(CC2538, self).__init__(command_interface)
         self.flash_start_addr = 0x00200000
+        self.nv_start_addr = 0x0027c800
+        self.nv_end_addr = 0x0027F7FF
         self.addr_ieee_address_secondary = 0x0027ffcc
         self.has_cmd_set_xosc = True
         self.bootloader_dis_val = 0xefffffff
@@ -707,10 +711,40 @@ class CC2538(Chip):
                % (pg_major, pg_minor, self.size >> 10, sram,
                   self.bootloader_address))
         mdebug(5, "Primary IEEE Address: %s" % (':'.join('%02X' % x for x in ieee_addr)))
+    
+    def get_n_bytes(self, mode):
+        if mode == 'full':
+            return self.size
+        if mode == 'code_only':
+            return self.nv_start_addr - self.flash_start_addr
+        if mode == 'nv_only':
+            return self.nv_end_addr - self.nv_start_addr
+        if mode == 'post_nv':
+            return (self.flash_start_addr + self.size) - self.nv_end_addr
+        return -1
+        
+    def crc(self, address, size):
+        print('Checksumming %s bytes (0x%08X - 0x%08X)' % (size, address, address + size))
+        return getattr(self.command_interface, self.crc_cmd)(address, size)
 
-    def erase(self):
-        mdebug(5, "Erasing %s bytes starting at address 0x%08X" % (self.size, self.flash_start_addr))
-        return self.command_interface.cmdEraseMemory(self.flash_start_addr, self.size)
+    def erase(self, mode):
+        start_addr = self.flash_start_addr
+        n_bytes = self.get_n_bytes(mode)
+        if n_bytes < 0:
+            return False
+        if mode == 'full':
+            pass
+        elif mode == 'code_only':
+            pass
+        elif mode == 'nv_only':
+            start_addr = self.nv_start_addr
+            pass
+        elif mode == 'post_nv':
+            start_addr = self.nv_end_addr
+        else:
+            return False
+        mdebug(5, "Erasing %s bytes (0x%08X - 0x%08X)" % (n_bytes, start_addr, start_addr + n_bytes))
+        return self.command_interface.cmdEraseMemory(start_addr, n_bytes)
 
     def read_memory(self, addr):
         # CC2538's COMMAND_MEMORY_READ sends each 4-byte number in inverted
@@ -820,7 +854,7 @@ class CC26xx(Chip):
 
         return "%s %s" % (chip_str, pg_str)
 
-    def erase(self):
+    def erase(self, mode):
         mdebug(5, "Erasing all main bank flash sectors")
         return self.command_interface.cmdBankErase()
 
@@ -831,7 +865,7 @@ class CC26xx(Chip):
 
 def query_yes_no(question, default="yes"):
     valid = {"yes":True,   "y":True,  "ye":True,
-             "no":False,     "n":False}
+            "no":False,     "n":False}
     if default == None:
         prompt = " [y/n] "
     elif default == "yes":
@@ -853,7 +887,7 @@ def query_yes_no(question, default="yes"):
             return valid[choice]
         else:
             sys.stdout.write("Please respond with 'yes' or 'no' "\
-                             "(or 'y' or 'n').\n")
+                            "(or 'y' or 'n').\n")
 
 # Convert the entered IEEE address into an integer
 def parse_ieee_address (inaddr):
@@ -879,7 +913,7 @@ def print_version():
     # Get the version using "git describe".
     try:
         p = Popen(['git', 'describe', '--tags', '--match', '[0-9]*'],
-                  stdout=PIPE, stderr=PIPE)
+                stdout=PIPE, stderr=PIPE)
         p.stderr.close()
         line = p.stdout.readlines()[0]
         version = line.strip()
@@ -889,12 +923,13 @@ def print_version():
     print('%s %s' % (sys.argv[0], version))
 
 def usage():
-    print("""Usage: %s [-DhqVfewvr] [-l length] [-p port] [-b baud] [-a addr] [-i addr] [--bootloader-active-high] [--bootloader-invert-lines] [file.bin]
+    print("""Usage: %s [-DhqVfewvr] [-l length] [-p port] [-b baud] [-a addr] [-i addr] [--bootloader-active-high] [--bootloader-invert-lines] [--erase mode] [file.bin]
     -h, --help               This help
     -q                       Quiet
     -V                       Verbose
     -f                       Force operation(s) without asking any questions
-    -e                       Erase (full)
+    -e                       Erase (shorthand for --erase full)
+    --erase mode             Erase (full, code_only, nv_only, post_nv)
     -w                       Write
     -v                       Verify (CRC32 check)
     -r                       Read
@@ -923,6 +958,7 @@ if __name__ == "__main__":
             'address': None,
             'force': 0,
             'erase': 0,
+            'partial_erase': 0,
             'write': 0,
             'verify': 0,
             'read': 0,
@@ -937,7 +973,7 @@ if __name__ == "__main__":
 # http://www.python.org/doc/2.5.2/lib/module-getopt.html
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "DhqVfewvrp:b:a:l:i:", ['help', 'ieee-address=', 'disable-bootloader', 'bootloader-active-high', 'bootloader-invert-lines', 'version'])
+        opts, args = getopt.getopt(sys.argv[1:], "DhqVfEwvrep:b:a:l:i:", ['help', 'erase=', 'ieee-address=', 'disable-bootloader', 'bootloader-active-high', 'bootloader-invert-lines', 'version'])
     except getopt.GetoptError as err:
         # print help information and exit:
         print(str(err)) # will print something like "option -a not recognized"
@@ -955,7 +991,9 @@ if __name__ == "__main__":
         elif o == '-f':
             conf['force'] = 1
         elif o == '-e':
-            conf['erase'] = 1
+            conf['erase'] = 'full'
+        elif o == '--erase':
+            conf['erase'] = str(a).lower()
         elif o == '-w':
             conf['write'] = 1
         elif o == '-v':
@@ -997,6 +1035,7 @@ if __name__ == "__main__":
             if not ( conf['force'] or query_yes_no("You are reading and writing to the same file. This will overwrite your input file. "\
             "Do you want to continue?","no") ):
                 raise Exception('Aborted by user.')
+            
         if conf['erase'] and conf['read'] and not conf['write']:
             if not ( conf['force'] or query_yes_no("You are about to erase your target before reading. "\
             "Do you want to continue?","no") ):
@@ -1070,15 +1109,20 @@ if __name__ == "__main__":
 
         if conf['erase']:
             # we only do full erase for now
-            if device.erase():
-                mdebug(5, "    Erase done")
+            if device.erase(conf['erase']):
+                mdebug(5, "    %s erase done" % (conf['erase']))
             else:
-                raise CmdException("Erase failed")
+                raise CmdException("%s erase failed" % (conf['erase']))
+
+        if conf['partial_erase']:
+            # Erases up to start of NV memory
+            if device.partial_erase():
+                mdebug(5, "    Partial erase done")
+            else:
+                raise CmdException("Partial erase failed")
 
         if conf['write']:
             # TODO: check if boot loader back-door is open, need to read flash size first to get address
-            if not conf['erase']:
-                device.command_interface.cmdEraseMemory(device.flash_start_addr, len(firmware.bytes))
             if cmd.writeMemory(conf['address'], firmware.bytes):
                 mdebug(5, "    Write done                                ")
             else:
@@ -1086,9 +1130,13 @@ if __name__ == "__main__":
 
         if conf['verify']:
             mdebug(5,"Verifying by comparing CRC32 calculations.")
-
-            crc_local = firmware.crc32()
-            crc_target = device.crc(conf['address'], len(firmware.bytes)) #CRC of target will change according to length input file
+            
+            # Checksum target up to input firmware length or erased length
+            crc_n_bytes = len(firmware.bytes)
+            if (conf['erase']):
+                crc_n_bytes = device.get_n_bytes(conf['erase'])
+            crc_local = firmware.crc32(crc_n_bytes)
+            crc_target = device.crc(conf['address'], crc_n_bytes)
 
             if crc_local == crc_target:
                 mdebug(5, "    Verified (match: 0x%08x)" % crc_local)
@@ -1134,3 +1182,4 @@ if __name__ == "__main__":
         if QUIET >= 10:
             traceback.print_exc()
         exit('ERROR: %s' % str(err))
+
