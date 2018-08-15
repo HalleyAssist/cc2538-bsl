@@ -854,6 +854,9 @@ class CC26xx(Chip):
 
         return "%s %s" % (chip_str, pg_str)
 
+    def get_n_bytes(self, mode):
+        return FLASH_SIZE
+
     def erase(self, mode):
         mdebug(5, "Erasing all main bank flash sectors")
         return self.command_interface.cmdBankErase()
@@ -923,18 +926,18 @@ def print_version():
     print('%s %s' % (sys.argv[0], version))
 
 def usage():
-    print("""Usage: %s [-DhqVfewvr] [-l length] [-p port] [-b baud] [-a addr] [-i addr] [--bootloader-active-high] [--bootloader-invert-lines] [--erase mode] [file.bin]
+    print("""Usage: %s [-DhqVfewvr] [-l length] [-p port] [-b baud] [-a addr] [-i addr] [--bootloader-active-high] [--bootloader-invert-lines] [file.bin]
     -h, --help               This help
     -q                       Quiet
     -V                       Verbose
     -f                       Force operation(s) without asking any questions
     -e                       Erase (shorthand for --erase full)
-    --erase mode             Erase (full, code_only, nv_only, post_nv)
     -w                       Write
     -v                       Verify (CRC32 check)
     -r                       Read
     -l length                Length of read
     -p port                  Serial port (default: first USB-like port in /dev)
+    -s section               Section for write/erase (full, code_only)
     -b baud                  Baud speed (default: 500000)
     -a addr                  Target address
     -i, --ieee-address addr  Set the secondary 64 bit IEEE address
@@ -958,11 +961,11 @@ if __name__ == "__main__":
             'address': None,
             'force': 0,
             'erase': 0,
-            'partial_erase': 0,
             'write': 0,
             'verify': 0,
             'read': 0,
             'len': 0x80000,
+            'section': 'full',
             'fname':'',
             'ieee_address': 0,
             'bootloader_active_high': False,
@@ -973,7 +976,7 @@ if __name__ == "__main__":
 # http://www.python.org/doc/2.5.2/lib/module-getopt.html
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "DhqVfEwvrep:b:a:l:i:", ['help', 'erase=', 'ieee-address=', 'disable-bootloader', 'bootloader-active-high', 'bootloader-invert-lines', 'version'])
+        opts, args = getopt.getopt(sys.argv[1:], "DhqVfEwvrep:b:a:l:i:s:", ['help', 'ieee-address=', 'disable-bootloader', 'bootloader-active-high', 'bootloader-invert-lines', 'version'])
     except getopt.GetoptError as err:
         # print help information and exit:
         print(str(err)) # will print something like "option -a not recognized"
@@ -990,10 +993,10 @@ if __name__ == "__main__":
             sys.exit(0)
         elif o == '-f':
             conf['force'] = 1
+        elif o == '-s':
+            conf['section'] = str(a).lower()
         elif o == '-e':
-            conf['erase'] = 'full'
-        elif o == '--erase':
-            conf['erase'] = str(a).lower()
+            conf['erase'] = 1
         elif o == '-w':
             conf['write'] = 1
         elif o == '-v':
@@ -1047,6 +1050,9 @@ if __name__ == "__main__":
         if conf['len'] < 0:
             raise Exception('Length must be positive but %d was provided'
                             % (conf['len'],))
+
+        if conf['section'] not in ['full', 'code_only']:
+            raise Exception('Section for erase/write must be full or code_only (not %s)' % conf['section'])
 
         # Try and find the port automatically
         if conf['port'] == 'auto':
@@ -1109,21 +1115,16 @@ if __name__ == "__main__":
 
         if conf['erase']:
             # we only do full erase for now
-            if device.erase(conf['erase']):
+            if device.erase(conf['section']):
                 mdebug(5, "    %s erase done" % (conf['erase']))
             else:
                 raise CmdException("%s erase failed" % (conf['erase']))
 
-        if conf['partial_erase']:
-            # Erases up to start of NV memory
-            if device.partial_erase():
-                mdebug(5, "    Partial erase done")
-            else:
-                raise CmdException("Partial erase failed")
-
         if conf['write']:
             # TODO: check if boot loader back-door is open, need to read flash size first to get address
-            if cmd.writeMemory(conf['address'], firmware.bytes):
+            bytes_to_write = min(device.get_n_bytes(conf['section']), len(firmware.bytes))
+            mdebug(6, "Writing %d bytes (firmware has %d)" % (bytes_to_write, len(firmware.bytes)))
+            if cmd.writeMemory(conf['address'], firmware.bytes[0:bytes_to_write]):
                 mdebug(5, "    Write done                                ")
             else:
                 raise CmdException("Write failed                       ")
@@ -1134,7 +1135,7 @@ if __name__ == "__main__":
             # Checksum target up to input firmware length or erased length
             crc_n_bytes = len(firmware.bytes)
             if (conf['erase']):
-                crc_n_bytes = device.get_n_bytes(conf['erase'])
+                crc_n_bytes = device.get_n_bytes(conf['section'])
             crc_local = firmware.crc32(crc_n_bytes)
             crc_target = device.crc(conf['address'], crc_n_bytes)
 
