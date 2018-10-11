@@ -29,7 +29,7 @@
 
 # Implementation based on stm32loader by Ivan A-R <ivan@tuxotronic.org>
 
-# Serial boot loader over UART for CC13xx / CC2538 / CC26xx
+# Serial boot loader over UART for CC2538
 # Based on the info found in TI's swru333a.pdf (spma029.pdf)
 #
 # Bootloader only starts if no valid image is found or if boot loader
@@ -671,7 +671,6 @@ class CC2538(Chip):
         self.flash_start_addr = 0x00200000
         self.nv_start_addr = 0x0027c800
         self.nv_end_addr = 0x0027F7FF
-        self.addr_ieee_address_secondary = 0x0027ffcc
         self.has_cmd_set_xosc = True
         self.bootloader_dis_val = 0xefffffff
         self.crc_cmd = "cmdCRC32"
@@ -679,7 +678,6 @@ class CC2538(Chip):
         FLASH_CTRL_DIECFG0 = 0x400D3014
         FLASH_CTRL_DIECFG2 = 0x400D301C
         addr_ieee_address_primary = 0x00280028
-        ccfg_len = 44
 
         #Read out primary IEEE address, flash and RAM size
         model = self.command_interface.cmdMemRead(FLASH_CTRL_DIECFG0)
@@ -688,7 +686,12 @@ class CC2538(Chip):
             self.size *= 0x20000 # in bytes
         else:
             self.size = 0x10000 # in bytes
-        self.bootloader_address = self.flash_start_addr + self.size - ccfg_len
+
+        
+        self.image_valid_address = self.flash_start_addr + self.size - 40
+        self.entry_point_address = self.flash_start_addr + self.size - 36
+        #self.cca_start = self.flash_start_addr + self.size
+        self.bootloader_address = self.flash_start_addr + self.size - 44
 
         sram = (((model[2] << 8) | model[3]) & 0x380) >> 7
         sram = (2 - sram) << 3 if sram <= 1 else 32 # in KB
@@ -717,34 +720,39 @@ class CC2538(Chip):
             return self.size
         if mode == 'code_only':
             return self.nv_start_addr - self.flash_start_addr
-        if mode == 'nv_only':
+        if mode == 'nvram':
             return self.nv_end_addr - self.nv_start_addr
         if mode == 'post_nv':
             return (self.flash_start_addr + self.size) - self.nv_end_addr
+        elif mode == 'cca':
+            return 44
         return -1
+
+    def get_start_address(self, mode):
+        if mode == 'full':
+            return self.flash_start_addr
+        elif mode == 'code_only':
+            return self.flash_start_addr
+        elif mode == 'nvram':
+            return self.nv_start_addr
+        elif mode == 'post_nv':
+            return self.nv_end_addr
+        elif mode == 'cca':
+            return self.bootloader_address
         
     def crc(self, address, size):
         print('Checksumming %s bytes (0x%08X - 0x%08X)' % (size, address, address + size))
         return getattr(self.command_interface, self.crc_cmd)(address, size)
 
-    def erase(self, mode):
-        start_addr = self.flash_start_addr
-        n_bytes = self.get_n_bytes(mode)
+    def erase(self, start_addr, n_bytes, to_write):
         if n_bytes < 0:
-            return False
-        if mode == 'full':
-            pass
-        elif mode == 'code_only':
-            pass
-        elif mode == 'nv_only':
-            start_addr = self.nv_start_addr
-            pass
-        elif mode == 'post_nv':
-            start_addr = self.nv_end_addr
+            return False        
+       
+        mdebug(5, "Erasing %s bytes (0x%08X - 0x%08X) with 0x%02x" % (n_bytes, start_addr, start_addr + n_bytes, to_write))
+        if to_write == 0xFF:
+            return self.command_interface.cmdEraseMemory(start_addr, n_bytes)
         else:
-            return False
-        mdebug(5, "Erasing %s bytes (0x%08X - 0x%08X)" % (n_bytes, start_addr, start_addr + n_bytes))
-        return self.command_interface.cmdEraseMemory(start_addr, n_bytes)
+            return self.command_interface.writeMemory(start_addr, [to_write] * n_bytes)
 
     def read_memory(self, addr):
         # CC2538's COMMAND_MEMORY_READ sends each 4-byte number in inverted
@@ -752,119 +760,6 @@ class CC2538(Chip):
         data = self.command_interface.cmdMemRead(addr)
         return bytearray([data[x] for x in range(3, -1, -1)])
 
-class CC26xx(Chip):
-    # Class constants
-    MISC_CONF_1 = 0x500010A0
-    PROTO_MASK_BLE = 0x01
-    PROTO_MASK_IEEE = 0x04
-    PROTO_MASK_BOTH = 0x05
-
-    def __init__(self, command_interface):
-        super(CC26xx, self).__init__(command_interface)
-        self.bootloader_dis_val = 0x00000000
-        self.crc_cmd = "cmdCRC32CC26xx"
-
-        ICEPICK_DEVICE_ID = 0x50001318
-        FCFG_USER_ID = 0x50001294
-        PRCM_RAMHWOPT = 0x40082250
-        FLASH_SIZE = 0x4003002C
-        addr_ieee_address_primary = 0x500012F0
-        ccfg_len = 88
-        ieee_address_secondary_offset = 0x20
-        bootloader_dis_offset = 0x30
-        sram = "Unknown"
-
-        # Determine CC13xx vs CC26xx via ICEPICK_DEVICE_ID::WAFER_ID and store
-        # PG revision
-        device_id = self.command_interface.cmdMemReadCC26xx(ICEPICK_DEVICE_ID)
-        wafer_id = (((device_id[3] & 0x0F) << 16) +
-                    (device_id[2] << 8) +
-                    (device_id[1] & 0xF0)) >> 4
-        pg_rev = (device_id[3] & 0xF0) >> 4
-
-        # Read FCFG1_USER_ID to get the package and supported protocols
-        user_id = self.command_interface.cmdMemReadCC26xx(FCFG_USER_ID)
-        package = {0x00: '4x4mm', 0x01: '5x5mm', 0x02: '7x7mm'}.get(user_id[2] & 0x03, "Unknown")
-        protocols = user_id[1] >> 4
-
-        # We can now detect the exact device
-        if wafer_id == 0xB99A:
-            chip = self._identify_cc26xx(pg_rev, protocols)
-        elif wafer_id == 0xB9BE:
-            chip = self._identify_cc13xx(pg_rev, protocols)
-
-        # Read flash size, calculate and store bootloader disable address
-        self.size = self.command_interface.cmdMemReadCC26xx(FLASH_SIZE)[0] * 4096
-        self.bootloader_address = self.size - ccfg_len + bootloader_dis_offset
-        self.addr_ieee_address_secondary = self.size - ccfg_len + ieee_address_secondary_offset
-
-        # RAM size
-        ramhwopt_size = self.command_interface.cmdMemReadCC26xx(PRCM_RAMHWOPT)[0] & 3
-        if ramhwopt_size == 3:
-            sram = "20KB"
-        elif ramhwopt_size == 2:
-            sram = "16KB"
-        else:
-            sram = "Unknown"
-
-        # Primary IEEE address. Stored with the MSB at the high address
-        ieee_addr = self.command_interface.cmdMemReadCC26xx(addr_ieee_address_primary + 4)[::-1]
-        ieee_addr += self.command_interface.cmdMemReadCC26xx(addr_ieee_address_primary)[::-1]
-
-        mdebug(5, "%s (%s): %dKB Flash, %s SRAM, CCFG.BL_CONFIG at 0x%08X"
-               % (chip, package, self.size >> 10, sram,
-                  self.bootloader_address))
-        mdebug(5, "Primary IEEE Address: %s" % (':'.join('%02X' % x for x in ieee_addr)))
-
-    def _identify_cc26xx(self, pg, protocols):
-        chips_dict = {
-            CC26xx.PROTO_MASK_IEEE: 'CC2630',
-            CC26xx.PROTO_MASK_BLE: 'CC2640',
-            CC26xx.PROTO_MASK_BOTH: 'CC2650',
-        }
-
-        chip_str = chips_dict.get(protocols & CC26xx.PROTO_MASK_BOTH, "Unknown")
-
-        if pg == 1:
-            pg_str = "PG1.0"
-        elif pg == 3:
-            pg_str = "PG2.0"
-        elif pg == 7:
-            pg_str = "PG2.1"
-        elif pg == 8:
-            rev_minor = self.command_interface.cmdMemReadCC26xx(CC26xx.MISC_CONF_1)[0]
-            if rev_minor == 0xFF:
-                rev_minor = 0x00
-            pg_str = "PG2.%d" % (2 + rev_minor,)
-
-        return "%s %s" % (chip_str, pg_str)
-
-    def _identify_cc13xx(self, pg, protocols):
-        chip_str = "CC1310"
-        if protocols & CC26xx.PROTO_MASK_IEEE == CC26xx.PROTO_MASK_IEEE:
-            chip_str = "CC1350"
-
-        if pg == 0:
-            pg_str = "PG1.0"
-        elif pg == 2:
-            rev_minor = self.command_interface.cmdMemReadCC26xx(CC26xx.MISC_CONF_1)[0]
-            if rev_minor == 0xFF:
-                rev_minor = 0x00
-            pg_str = "PG2.%d" % (rev_minor,)
-
-        return "%s %s" % (chip_str, pg_str)
-
-    def get_n_bytes(self, mode):
-        return FLASH_SIZE
-
-    def erase(self, mode):
-        mdebug(5, "Erasing all main bank flash sectors")
-        return self.command_interface.cmdBankErase()
-
-    def read_memory(self, addr):
-        # CC26xx COMMAND_MEMORY_READ returns contents in the same order as
-        # they are stored on the device
-        return self.command_interface.cmdMemReadCC26xx(addr)
 
 def query_yes_no(question, default="yes"):
     valid = {"yes":True,   "y":True,  "ye":True,
@@ -960,13 +855,15 @@ if __name__ == "__main__":
             'force_speed' : 0,
             'address': None,
             'force': 0,
-            'erase': 0,
+            'erase': None,
             'write': 0,
             'verify': 0,
             'read': 0,
             'len': 0x80000,
             'section': 'full',
             'fname':'',
+            'img_valid': None,
+            'entry_point': None,
             'ieee_address': 0,
             'bootloader_active_high': False,
             'bootloader_invert_lines' : False,
@@ -976,7 +873,7 @@ if __name__ == "__main__":
 # http://www.python.org/doc/2.5.2/lib/module-getopt.html
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "DhqVfEwvrep:b:a:l:i:s:", ['help', 'ieee-address=', 'disable-bootloader', 'bootloader-active-high', 'bootloader-invert-lines', 'version'])
+        opts, args = getopt.getopt(sys.argv[1:], "DhqVfEwvrp:b:e:a:l:i:s:m:k:", ['help', 'ieee-address=', 'img-valid=', 'entry-point=', 'disable-bootloader', 'bootloader-active-high', 'bootloader-invert-lines', 'version'])
     except getopt.GetoptError as err:
         # print help information and exit:
         print(str(err)) # will print something like "option -a not recognized"
@@ -996,7 +893,7 @@ if __name__ == "__main__":
         elif o == '-s':
             conf['section'] = str(a).lower()
         elif o == '-e':
-            conf['erase'] = 1
+            conf['erase'] = int(str(a))
         elif o == '-w':
             conf['write'] = 1
         elif o == '-v':
@@ -1014,6 +911,10 @@ if __name__ == "__main__":
             conf['len'] = eval(a)
         elif o == '-i' or o == '--ieee-address':
             conf['ieee_address'] = str(a)
+        elif o == '-m' or o == '--img-valid':
+            conf['img_valid'] = int(str(a))
+        elif o == "-k" or o == "--entry-point":
+            conf["entry_point"] = int(str(a))
         elif o == '--bootloader-active-high':
             conf['bootloader_active_high'] = True
         elif o == '--bootloader-invert-lines':
@@ -1039,7 +940,7 @@ if __name__ == "__main__":
             "Do you want to continue?","no") ):
                 raise Exception('Aborted by user.')
             
-        if conf['erase'] and conf['read'] and not conf['write']:
+        if conf['erase'] is not None and conf['read'] and not conf['write']:
             if not ( conf['force'] or query_yes_no("You are about to erase your target before reading. "\
             "Do you want to continue?","no") ):
                 raise Exception('Aborted by user.')
@@ -1050,9 +951,6 @@ if __name__ == "__main__":
         if conf['len'] < 0:
             raise Exception('Length must be positive but %d was provided'
                             % (conf['len'],))
-
-        if conf['section'] not in ['full', 'code_only']:
-            raise Exception('Section for erase/write must be full or code_only (not %s)' % conf['section'])
 
         # Try and find the port automatically
         if conf['port'] == 'auto':
@@ -1075,6 +973,8 @@ if __name__ == "__main__":
         cmd.invoke_bootloader(conf['bootloader_active_high'], conf['bootloader_invert_lines'])
         mdebug(5, "Opening port %(port)s, baud %(baud)d" % {'port':conf['port'],
                                                       'baud':conf['baud']})
+
+        firmware = None
         if conf['write'] or conf['verify']:
             mdebug(5, "Reading data from %s" % args[0])
             firmware = FirmwareFile(args[0])
@@ -1091,15 +991,11 @@ if __name__ == "__main__":
         chip_id_str = CHIP_ID_STRS.get(chip_id, None)
 
         if chip_id_str is None:
-            mdebug(10, '    Unrecognized chip ID. Trying CC13xx/CC26xx')
-            device = CC26xx(cmd)
+            mdebug(10, '    Unrecognized chip ID')
         else:
             mdebug(10, "    Target id 0x%x, %s" % (chip_id, chip_id_str))
             device = CC2538(cmd)
 
-        # Choose a good default address unless the user specified -a
-        if conf['address'] is None:
-            conf['address'] = device.flash_start_addr
 
         if conf['force_speed'] != 1 and device.has_cmd_set_xosc:
             if cmd.cmdSetXOsc(): #switch to external clock source
@@ -1112,19 +1008,32 @@ if __name__ == "__main__":
                     raise CmdException("Can't connect to target after clock source switch. (Check external crystal)")
             else:
                 raise CmdException("Can't switch target to external clock source. (Try forcing speed)")
+        
+        bytes_to_write = device.get_n_bytes(conf['section'])
 
-        if conf['erase']:
+        start_addr = device.get_start_address(conf['section'])
+
+        # Choose a good default address unless the user specified -a
+        fw_start = 0
+        if conf['address'] is None:
+            conf['address'] = start_addr
+            fw_start = start_addr - device.flash_start_addr
+        
+        if firmware:
+            bytes_to_write = min(bytes_to_write, len(firmware.bytes) - fw_start)
+
+
+        if conf['erase'] is not None:
             # we only do full erase for now
-            if device.erase(conf['section']):
+            if device.erase(start_addr, bytes_to_write, conf['erase']):
                 mdebug(5, "    %s erase done" % (conf['erase']))
             else:
                 raise CmdException("%s erase failed" % (conf['erase']))
 
         if conf['write']:
             # TODO: check if boot loader back-door is open, need to read flash size first to get address
-            bytes_to_write = min(device.get_n_bytes(conf['section']), len(firmware.bytes))
             mdebug(6, "Writing %d bytes (firmware has %d)" % (bytes_to_write, len(firmware.bytes)))
-            if cmd.writeMemory(conf['address'], firmware.bytes[0:bytes_to_write]):
+            if cmd.writeMemory(conf['address'], firmware.bytes[fw_start:fw_start+bytes_to_write]):
                 mdebug(5, "    Write done                                ")
             else:
                 raise CmdException("Write failed                       ")
@@ -1144,6 +1053,18 @@ if __name__ == "__main__":
             else:
                 cmd.cmdReset()
                 raise Exception("NO CRC32 match: Local = 0x%x, Target = 0x%x" % (crc_local,crc_target))
+
+        if conf['img_valid'] is not None:
+            if conf['img_valid']:
+                img_valid = [0, 0, 0, 0]
+            else:
+                img_valid = [0xFF, 0xFF, 0xFF, 0xFF]
+
+            cmd.writeMemory(device.image_valid_address, img_valid)
+
+        if conf['entry_point'] is not None:
+            entry_point = struct.pack("<I", conf['entry_point'])
+            cmd.writeMemory(device.entry_point_address, img_valid)
 
         if conf['ieee_address'] != 0:
             ieee_addr = parse_ieee_address(conf['ieee_address'])
@@ -1180,7 +1101,6 @@ if __name__ == "__main__":
         cmd.cmdReset()
 
     except Exception as err:
-        if QUIET >= 10:
-            traceback.print_exc()
+        traceback.print_exc()
         exit('ERROR: %s' % str(err))
 
